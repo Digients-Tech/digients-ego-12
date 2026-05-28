@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+full_bucket="client-data-sample-plain-1302052962"
+smaller_bucket="smaller-sample-1302052962"
+bucket="$full_bucket"
+region="ap-beijing"
+remote_name="data_sample_plain_cos"
+full_default_dest_dir="./client-data-sample-plain"
+smaller_default_dest_dir="./smaller-sample"
+default_dest_dir="$full_default_dest_dir"
+dataset_title="Data Sample Plain"
+dataset_size_message="数据集约 88GB，请确认目标磁盘空间足够。"
+recommended_gib=100
+transfers="4"
+checkers="16"
+multi_thread_streams="4"
+multi_thread_cutoff="256M"
+active_child_pid=""
+
+usage() {
+  cat <<'USAGE'
+Data Sample Plain 预览/下载工具
+
+这个脚本是交互式的：
+  1. 输入腾讯云 SecretId 和 SecretKey。
+  2. 在终端菜单里选择“预览”或“下载”。
+
+已内置腾讯云 COS bucket：
+  Full dataset: client-data-sample-plain-1302052962
+  Smaller sample: smaller-sample-1302052962
+  region: ap-beijing
+
+启动后脚本会询问是否下载 smaller sample。选择 yes 会下载带
+scene/task_category 二级目录结构的小样本；默认 no 下载完整数据集。
+
+用法：
+  bash download_data_sample_tencent
+  bash download_data_sample_tencent --help
+
+如果你想用 ./download_data_sample_tencent 运行，需要先执行：
+  chmod +x download_data_sample_tencent
+
+说明：
+  - 需要先安装 rclone。
+  - “预览”只查看数据概况，不下载数据。
+  - “下载”会把 bucket 里的目录结构原样下载到本地目录。
+  - 下载中断后重新运行，会自动跳过已经完整下载的文件。
+USAGE
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Error: '$1' is not installed or not in PATH." >&2
+    echo >&2
+    echo "请先安装 rclone:" >&2
+    echo "  macOS:  brew install rclone" >&2
+    echo "  Ubuntu: sudo apt-get install rclone" >&2
+    echo "  Official docs: https://rclone.org/install/" >&2
+    echo >&2
+    echo "安装完成后，请重新运行:" >&2
+    echo "  bash download_data_sample_tencent" >&2
+    exit 1
+  fi
+}
+
+expand_user_path() {
+  local value="$1"
+
+  case "$value" in
+    "~")
+      printf '%s' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s/%s' "$HOME" "${value#~/}"
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+cleanup() {
+  if [[ -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
+    rm -rf "$tmp_dir"
+  fi
+}
+
+terminate() {
+  echo
+  echo "已中断，正在停止 rclone..." >&2
+
+  if [[ -n "$active_child_pid" ]] && kill -0 "$active_child_pid" >/dev/null 2>&1; then
+    kill -TERM "$active_child_pid" >/dev/null 2>&1 || true
+    sleep 2
+    if kill -0 "$active_child_pid" >/dev/null 2>&1; then
+      kill -KILL "$active_child_pid" >/dev/null 2>&1 || true
+    fi
+    wait "$active_child_pid" >/dev/null 2>&1 || true
+  fi
+
+  exit 130
+}
+
+run_rclone() {
+  local status
+
+  rclone --config "$config_file" "$@" &
+  active_child_pid=$!
+  set +e
+  wait "$active_child_pid"
+  status=$?
+  set -e
+  active_child_pid=""
+  return "$status"
+}
+
+write_config() {
+  cat >"$config_file" <<EOF
+[$remote_name]
+type = s3
+provider = TencentCOS
+env_auth = false
+access_key_id = $secret_id
+secret_access_key = $secret_key
+endpoint = cos.${region}.myqcloud.com
+acl = default
+EOF
+  chmod 600 "$config_file"
+}
+
+prompt_credentials() {
+  secret_id="${COS_SECRET_ID:-}"
+  secret_key="${COS_SECRET_KEY:-}"
+
+  echo "腾讯云登录信息"
+  echo "-------------------------"
+
+  if [[ -z "$secret_id" ]]; then
+    read -r -p "SecretId: " secret_id
+  else
+    echo "SecretId: 使用环境变量 COS_SECRET_ID"
+  fi
+
+  if [[ -z "$secret_key" ]]; then
+    read -r -s -p "SecretKey: " secret_key
+    printf '\n'
+  else
+    echo "SecretKey: 使用环境变量 COS_SECRET_KEY"
+  fi
+
+  if [[ -z "$secret_id" || -z "$secret_key" ]]; then
+    echo "Error: SecretId 和 SecretKey 不能为空。" >&2
+    exit 1
+  fi
+}
+
+press_enter() {
+  echo
+  read -r -p "按 Enter 返回菜单..."
+}
+
+select_dataset_variant() {
+  local answer
+
+  echo
+  read -r -p "是否下载带 scene/task_category 二级目录结构的 smaller sample？[y/N]: " answer
+  case "$answer" in
+    y|Y|yes|YES)
+      bucket="$smaller_bucket"
+      default_dest_dir="$smaller_default_dest_dir"
+      dataset_title="Smaller Sample"
+      dataset_size_message="Smaller sample 比完整数据集小，但仍请确认目标磁盘空间足够。"
+      recommended_gib=30
+      ;;
+    *)
+      bucket="$full_bucket"
+      default_dest_dir="$full_default_dest_dir"
+      dataset_title="Data Sample Plain"
+      dataset_size_message="数据集约 88GB，请确认目标磁盘空间足够。"
+      recommended_gib=100
+      ;;
+  esac
+
+  remote_path="${remote_name}:${bucket}"
+}
+
+preview_dataset() {
+  local dir_list_file
+  local dir_count
+
+  echo
+  echo "预览：${dataset_title}"
+  echo "--------------------------"
+  echo "Bucket: ${bucket}.cos.${region}.myqcloud.com"
+  echo
+  echo "正在读取数据大小和文件数量..."
+  run_rclone size "$remote_path"
+  echo
+  echo "根目录文件："
+  run_rclone lsf "$remote_path" --max-depth 1 --files-only
+  echo
+  echo "前 20 个目录："
+  dir_list_file="${tmp_dir}/sample_dirs.txt"
+  run_rclone lsf "$remote_path" --dirs-only >"$dir_list_file"
+  sed -n '1,20p' "$dir_list_file"
+  dir_count="$(wc -l <"$dir_list_file" | tr -d ' ')"
+  if [[ "$dir_count" =~ ^[0-9]+$ && "$dir_count" -gt 20 ]]; then
+    echo "... 还有 $((dir_count - 20)) 个样本文件夹"
+  fi
+  echo
+  echo "预览完成。"
+}
+
+nearest_existing_parent() {
+  local path="$1"
+
+  while [[ ! -e "$path" ]]; do
+    path="$(dirname "$path")"
+  done
+  printf '%s' "$path"
+}
+
+warn_disk_space() {
+  local dest_dir="$1"
+  local parent
+  local available_kb
+  local recommended_kb
+
+  parent="$(nearest_existing_parent "$dest_dir")"
+  recommended_kb=$((recommended_gib * 1024 * 1024))
+
+  if ! available_kb="$(df -Pk "$parent" 2>/dev/null | awk 'NR == 2 {print $4}')"; then
+    return
+  fi
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]]; then
+    return
+  fi
+
+  echo
+  echo "磁盘空间检查："
+  echo "  目标磁盘位置: $parent"
+  echo "  当前可用空间: $((available_kb / 1024 / 1024)) GiB"
+  echo "  建议可用空间: 至少 ${recommended_gib} GiB"
+
+  if (( available_kb < recommended_kb )); then
+    echo
+    echo "警告：可用空间可能不足以下载所选数据集。"
+    read -r -p "仍然继续吗？[y/N]: " answer
+    case "$answer" in
+      y|Y|yes|YES)
+        ;;
+      *)
+        echo "已取消下载。"
+        return 1
+        ;;
+    esac
+  fi
+}
+
+download_dataset() {
+  local dest_dir
+  local answer
+
+  echo
+  echo "下载：${dataset_title}"
+  echo "---------------------------"
+  echo "$dataset_size_message"
+  echo
+  read -r -p "下载到哪个本地目录？[${default_dest_dir}]: " dest_dir
+  if [[ -z "$dest_dir" ]]; then
+    dest_dir="$default_dest_dir"
+  fi
+  dest_dir="$(expand_user_path "$dest_dir")"
+
+  warn_disk_space "$dest_dir" || return
+
+  echo
+  echo "源 bucket: ${bucket}.cos.${region}.myqcloud.com"
+  echo "下载目录: $dest_dir"
+  echo "并行下载数: $transfers"
+  echo "大文件多线程数: $multi_thread_streams"
+  echo
+  read -r -p "现在开始下载吗？[Y/n]: " answer
+  case "$answer" in
+    n|N|no|NO)
+      echo "已取消下载。"
+      return
+      ;;
+  esac
+
+  mkdir -p "$dest_dir"
+  run_rclone copy "$remote_path" "$dest_dir" \
+    --progress \
+    --stats 10s \
+    --checkers "$checkers" \
+    --transfers "$transfers" \
+    --multi-thread-streams "$multi_thread_streams" \
+    --multi-thread-cutoff "$multi_thread_cutoff"
+
+  echo
+  echo "下载完成。"
+  echo "本地目录: $dest_dir"
+}
+
+show_menu() {
+  local choice
+
+  while true; do
+    echo
+    echo "========================================"
+    echo "${dataset_title}"
+    echo "========================================"
+    echo "1) 预览数据"
+    echo "2) 下载数据"
+    echo "3) 先预览，再下载"
+    echo "q) 退出"
+    echo
+    read -r -p "请选择 [1/2/3/q]: " choice
+
+    case "$choice" in
+      1)
+        preview_dataset
+        press_enter
+        ;;
+      2)
+        download_dataset
+        press_enter
+        ;;
+      3)
+        preview_dataset
+        download_dataset
+        press_enter
+        ;;
+      q|Q)
+        echo "已退出。"
+        exit 0
+        ;;
+      *)
+        echo "无效选项，请输入 1、2、3 或 q。"
+        ;;
+    esac
+  done
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+  echo "Error: unknown argument: $1" >&2
+  usage >&2
+  exit 1
+fi
+
+require_cmd rclone
+require_cmd awk
+require_cmd df
+require_cmd sed
+require_cmd tr
+require_cmd wc
+
+tmp_dir="$(mktemp -d)"
+config_file="${tmp_dir}/rclone.conf"
+remote_path="${remote_name}:${bucket}"
+
+trap cleanup EXIT
+trap terminate INT TERM
+
+select_dataset_variant
+prompt_credentials
+write_config
+show_menu

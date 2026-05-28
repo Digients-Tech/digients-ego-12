@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bucket="digients-recordings-sg"
+region="ap-southeast-1"
+full_prefix="uploads/client-data-sample-plain"
+smaller_prefix="uploads/smaller-sample"
+prefix="$full_prefix"
+remote_name="aws-s3"
+full_default_dest_dir="./client-data-sample-plain"
+smaller_default_dest_dir="./smaller-sample"
+default_dest_dir="$full_default_dest_dir"
+dataset_title="Data Sample Plain"
+dataset_size_message="Dataset size is about 88GB. Make sure the destination disk has enough space."
+recommended_gib=100
+transfers="4"
+checkers="16"
+multi_thread_streams="4"
+multi_thread_cutoff="256M"
+active_child_pid=""
+
+usage() {
+  cat <<'USAGE'
+Data Sample Plain preview/download helper for AWS S3.
+
+This script is intentionally interactive:
+  1. Enter AWS Access Key ID and AWS Secret Access Key.
+  2. Choose Preview or Download in the terminal menu.
+
+The data is available in AWS S3:
+  Provider: AWS S3
+  Region: ap-southeast-1
+  Bucket: digients-recordings-sg
+  Prefix: uploads/client-data-sample-plain/
+  S3 URI: s3://digients-recordings-sg/uploads/client-data-sample-plain/
+
+Smaller sample mirror:
+  Prefix: uploads/smaller-sample/
+  S3 URI: s3://digients-recordings-sg/uploads/smaller-sample/
+
+At startup the script asks whether to download the smaller sample with the
+scene/task_category L2 directory structure. The default answer is no, which
+downloads the full dataset.
+
+AWS Console:
+  https://ap-southeast-1.console.aws.amazon.com/s3/buckets/digients-recordings-sg?prefix=uploads%2Fclient-data-sample-plain%2F&region=ap-southeast-1&showversions=false&tab=objects
+
+Usage:
+  bash download_data_sample_aws
+  bash download_data_sample_aws --help
+
+If you prefer running ./download_data_sample_aws, first run:
+  chmod +x download_data_sample_aws
+
+Notes:
+  - Requires rclone.
+  - Preview only lists metadata and does not download the dataset.
+  - Download preserves the dataset directory structure under the chosen local directory.
+  - Re-running Download resumes/skips files that are already complete.
+  - AWS IAM username/password cannot be used by rclone/S3; use an access key.
+USAGE
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Error: '$1' is not installed or not in PATH." >&2
+    echo >&2
+    echo "Install rclone first:" >&2
+    echo "  macOS:  brew install rclone" >&2
+    echo "  Ubuntu: sudo apt-get install rclone" >&2
+    echo "  Official docs: https://rclone.org/install/" >&2
+    echo >&2
+    echo "After installing rclone, run this script again:" >&2
+    echo "  bash download_data_sample_aws" >&2
+    exit 1
+  fi
+}
+
+expand_user_path() {
+  local value="$1"
+
+  case "$value" in
+    "~")
+      printf '%s' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s/%s' "$HOME" "${value#~/}"
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+cleanup() {
+  if [[ -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
+    rm -rf "$tmp_dir"
+  fi
+}
+
+terminate() {
+  echo
+  echo "Interrupted. Stopping rclone..." >&2
+
+  if [[ -n "$active_child_pid" ]] && kill -0 "$active_child_pid" >/dev/null 2>&1; then
+    kill -TERM "$active_child_pid" >/dev/null 2>&1 || true
+    sleep 2
+    if kill -0 "$active_child_pid" >/dev/null 2>&1; then
+      kill -KILL "$active_child_pid" >/dev/null 2>&1 || true
+    fi
+    wait "$active_child_pid" >/dev/null 2>&1 || true
+  fi
+
+  exit 130
+}
+
+run_rclone() {
+  local status
+
+  rclone --config "$config_file" "$@" &
+  active_child_pid=$!
+  set +e
+  wait "$active_child_pid"
+  status=$?
+  set -e
+  active_child_pid=""
+  return "$status"
+}
+
+write_config() {
+  cat >"$config_file" <<EOF
+[$remote_name]
+type = s3
+provider = AWS
+env_auth = false
+access_key_id = $aws_access_key_id
+secret_access_key = $aws_secret_access_key
+region = $region
+location_constraint = $region
+EOF
+
+  if [[ -n "$aws_session_token" ]]; then
+    echo "session_token = $aws_session_token" >>"$config_file"
+  fi
+
+  chmod 600 "$config_file"
+}
+
+prompt_credentials() {
+  aws_access_key_id="${AWS_ACCESS_KEY_ID:-}"
+  aws_secret_access_key="${AWS_SECRET_ACCESS_KEY:-${AWS_SECRET_KEY:-}}"
+  aws_session_token="${AWS_SESSION_TOKEN:-}"
+
+  echo "AWS credentials"
+  echo "---------------"
+
+  if [[ -z "$aws_access_key_id" ]]; then
+    read -r -p "AWS Access Key ID: " aws_access_key_id
+  else
+    echo "AWS Access Key ID: using AWS_ACCESS_KEY_ID from environment"
+  fi
+
+  if [[ -z "$aws_secret_access_key" ]]; then
+    read -r -s -p "AWS Secret Access Key: " aws_secret_access_key
+    printf '\n'
+  else
+    echo "AWS Secret Access Key: using AWS_SECRET_ACCESS_KEY from environment"
+  fi
+
+  if [[ -z "$aws_access_key_id" || -z "$aws_secret_access_key" ]]; then
+    echo "Error: AWS Access Key ID and AWS Secret Access Key are required." >&2
+    echo "AWS IAM username/password cannot be used by rclone/S3." >&2
+    exit 1
+  fi
+}
+
+press_enter() {
+  echo
+  read -r -p "Press Enter to return to the menu..."
+}
+
+select_dataset_variant() {
+  local answer
+
+  echo
+  read -r -p "Download the smaller sample with scene/task_category L2 directory structure? [y/N]: " answer
+  case "$answer" in
+    y|Y|yes|YES)
+      prefix="$smaller_prefix"
+      default_dest_dir="$smaller_default_dest_dir"
+      dataset_title="Smaller Sample"
+      dataset_size_message="The smaller sample is smaller than the full dataset, but make sure the destination disk has enough space."
+      recommended_gib=30
+      ;;
+    *)
+      prefix="$full_prefix"
+      default_dest_dir="$full_default_dest_dir"
+      dataset_title="Data Sample Plain"
+      dataset_size_message="Dataset size is about 88GB. Make sure the destination disk has enough space."
+      recommended_gib=100
+      ;;
+  esac
+
+  remote_path="${remote_name}:${bucket}/${prefix}"
+}
+
+preview_dataset() {
+  local dir_list_file
+  local dir_count
+
+  echo
+  echo "Preview: ${dataset_title}"
+  echo "--------------------------"
+  echo "S3 URI: s3://${bucket}/${prefix}/"
+  echo "Region: ${region}"
+  echo
+  echo "Reading dataset size and file count..."
+  run_rclone size "$remote_path"
+  echo
+  echo "Root files under the dataset prefix:"
+  run_rclone lsf "$remote_path" --max-depth 1 --files-only
+  echo
+  echo "First sample folders:"
+  dir_list_file="${tmp_dir}/sample_dirs.txt"
+  run_rclone lsf "$remote_path" --dirs-only >"$dir_list_file"
+  sed -n '1,20p' "$dir_list_file"
+  dir_count="$(wc -l <"$dir_list_file" | tr -d ' ')"
+  if [[ "$dir_count" =~ ^[0-9]+$ && "$dir_count" -gt 20 ]]; then
+    echo "... and $((dir_count - 20)) more sample folders"
+  fi
+  echo
+  echo "Preview complete."
+}
+
+nearest_existing_parent() {
+  local path="$1"
+
+  while [[ ! -e "$path" ]]; do
+    path="$(dirname "$path")"
+  done
+  printf '%s' "$path"
+}
+
+warn_disk_space() {
+  local dest_dir="$1"
+  local parent
+  local available_kb
+  local recommended_kb
+
+  parent="$(nearest_existing_parent "$dest_dir")"
+  recommended_kb=$((recommended_gib * 1024 * 1024))
+
+  if ! available_kb="$(df -Pk "$parent" 2>/dev/null | awk 'NR == 2 {print $4}')"; then
+    return
+  fi
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]]; then
+    return
+  fi
+
+  echo
+  echo "Disk space check:"
+  echo "  Destination parent: $parent"
+  echo "  Available: $((available_kb / 1024 / 1024)) GiB"
+  echo "  Recommended: at least ${recommended_gib} GiB"
+
+  if (( available_kb < recommended_kb )); then
+    echo
+    echo "Warning: available space may be too low for the selected dataset."
+    read -r -p "Continue anyway? [y/N]: " answer
+    case "$answer" in
+      y|Y|yes|YES)
+        ;;
+      *)
+        echo "Download cancelled."
+        return 1
+        ;;
+    esac
+  fi
+}
+
+download_dataset() {
+  local dest_dir
+  local answer
+
+  echo
+  echo "Download: ${dataset_title}"
+  echo "---------------------------"
+  echo "$dataset_size_message"
+  echo
+  read -r -p "Download directory [${default_dest_dir}]: " dest_dir
+  if [[ -z "$dest_dir" ]]; then
+    dest_dir="$default_dest_dir"
+  fi
+  dest_dir="$(expand_user_path "$dest_dir")"
+
+  warn_disk_space "$dest_dir" || return
+
+  echo
+  echo "Source: s3://${bucket}/${prefix}/"
+  echo "Destination: $dest_dir"
+  echo "Parallel transfers: $transfers"
+  echo "Large-file streams: $multi_thread_streams"
+  echo
+  read -r -p "Start download now? [Y/n]: " answer
+  case "$answer" in
+    n|N|no|NO)
+      echo "Download cancelled."
+      return
+      ;;
+  esac
+
+  mkdir -p "$dest_dir"
+  run_rclone copy "$remote_path" "$dest_dir" \
+    --progress \
+    --stats 10s \
+    --checkers "$checkers" \
+    --transfers "$transfers" \
+    --multi-thread-streams "$multi_thread_streams" \
+    --multi-thread-cutoff "$multi_thread_cutoff"
+
+  echo
+  echo "Download complete."
+  echo "Local directory: $dest_dir"
+}
+
+show_menu() {
+  local choice
+
+  while true; do
+    echo
+    echo "========================================"
+    echo "${dataset_title} - AWS S3"
+    echo "========================================"
+    echo "1) Preview dataset"
+    echo "2) Download dataset"
+    echo "3) Preview, then download"
+    echo "q) Quit"
+    echo
+    read -r -p "Choose an option [1/2/3/q]: " choice
+
+    case "$choice" in
+      1)
+        preview_dataset
+        press_enter
+        ;;
+      2)
+        download_dataset
+        press_enter
+        ;;
+      3)
+        preview_dataset
+        download_dataset
+        press_enter
+        ;;
+      q|Q)
+        echo "Bye."
+        exit 0
+        ;;
+      *)
+        echo "Invalid option. Please choose 1, 2, 3, or q."
+        ;;
+    esac
+  done
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+  echo "Error: unknown argument: $1" >&2
+  usage >&2
+  exit 1
+fi
+
+require_cmd rclone
+require_cmd awk
+require_cmd df
+require_cmd sed
+require_cmd tr
+require_cmd wc
+
+tmp_dir="$(mktemp -d)"
+config_file="${tmp_dir}/rclone.conf"
+remote_path="${remote_name}:${bucket}/${prefix}"
+
+trap cleanup EXIT
+trap terminate INT TERM
+
+select_dataset_variant
+prompt_credentials
+write_config
+show_menu
